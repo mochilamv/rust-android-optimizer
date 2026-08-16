@@ -17,13 +17,18 @@ echo -e "${COLOR_BLUE}==========================================================
 echo -e "${COLOR_BLUE}               RUST ANDROID OPTIMIZER - INSTALADOR NATIVO               ${COLOR_RESET}"
 echo -e "${COLOR_BLUE}========================================================================${COLOR_RESET}"
 
-# 1. Checagem de Arquitetura
+# 1. Checagem de Arquitetura e CPU
 ARCH=$(uname -m)
 if [ "$ARCH" != "aarch64" ] && [ "$ARCH" != "arm64" ]; then
     echo -e "${COLOR_RED}[ERRO FATAL] Arquitetura incompativel: $ARCH. Apenas aarch64 (ARM64) e suportada.${COLOR_RESET}"
     exit 1
 fi
-echo -e "${COLOR_GREEN}[OK] Arquitetura detectada: $ARCH${COLOR_RESET}"
+
+CPU_MODEL=$(getprop ro.soc.model 2>/dev/null || true)
+if [ -z "$CPU_MODEL" ]; then
+    CPU_MODEL=$(getprop ro.hardware 2>/dev/null || uname -m)
+fi
+echo -e "${COLOR_GREEN}[OK] Arquitetura detectada: $ARCH (SoC / CPU: $CPU_MODEL)${COLOR_RESET}"
 
 # 2. Checagem do Shizuku / Rish
 RISH_PATH="/data/data/com.termux/files/usr/bin/rish"

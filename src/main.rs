@@ -260,6 +260,7 @@ async fn handle_cmd_daemon() {
         let lock = compiler.lock().await;
         aot_compiler::CompilerHandle {
             suspended: lock.get_suspended_flag(),
+            abort_notify: lock.get_abort_notify(),
             notify: lock.get_notify(),
             current_package: lock.get_current_package_arc(),
         }

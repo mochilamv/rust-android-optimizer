@@ -249,20 +249,48 @@ pub fn parse_refresh_rates_from_dumpsys(dumpsys: &str) -> Vec<f32> {
     let mut rates = Vec::new();
 
     for line in dumpsys.lines() {
-        if line.contains("fps=") || line.contains("fps:") || line.contains("supportedRefreshRates") || line.contains("renderFrameRate") {
+        // Pattern 1: "renderFrameRate 120.00 fps" or "renderFrameRate=120.0"
+        if line.contains("renderFrameRate") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            for (idx, part) in parts.iter().enumerate() {
+                if *part == "renderFrameRate" {
+                    if let Some(next) = parts.get(idx + 1) {
+                        if let Ok(val) = next.trim().parse::<f32>() {
+                            if (30.0..=360.0).contains(&val) {
+                                rates.push(val.round());
+                            }
+                        }
+                    }
+                } else if let Some(stripped) = part.strip_prefix("renderFrameRate=") {
+                    let cleaned = stripped.trim_end_matches([',', ';', ')', '}']);
+                    if let Ok(val) = cleaned.parse::<f32>() {
+                        if (30.0..=360.0).contains(&val) {
+                            rates.push(val.round());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 2: "fps=120.0" or "fps: 120.0" or "fps 120.0"
+        if line.contains("fps") {
             let bytes = line.as_bytes();
             let mut i = 0;
             while i < bytes.len() {
-                // Find "fps="
-                if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"fps=" {
-                    let start = i + 4;
+                if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"fps" {
+                    let mut start = i + 3;
+                    while start < bytes.len() && (bytes[start] == b'=' || bytes[start] == b':' || bytes[start] == b' ') {
+                        start += 1;
+                    }
                     let mut end = start;
                     while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
                         end += 1;
                     }
-                    if let Ok(val) = line[start..end].parse::<f32>() {
-                        if val >= 30.0 && val <= 360.0 {
-                            rates.push(val.round());
+                    if start < end {
+                        if let Ok(val) = line[start..end].parse::<f32>() {
+                            if (30.0..=360.0).contains(&val) {
+                                rates.push(val.round());
+                            }
                         }
                     }
                     i = end;
@@ -270,17 +298,18 @@ pub fn parse_refresh_rates_from_dumpsys(dumpsys: &str) -> Vec<f32> {
                     i += 1;
                 }
             }
+        }
 
-            // Also check for array patterns like [120.0, 90.0, 60.0]
-            if line.contains("supportedRefreshRates") {
-                if let Some(start) = line.find('[') {
-                    if let Some(end) = line[start..].find(']') {
-                        let inner = &line[start + 1..start + end];
-                        for part in inner.split(',') {
-                            if let Ok(val) = part.trim().parse::<f32>() {
-                                if val >= 30.0 && val <= 360.0 {
-                                    rates.push(val.round());
-                                }
+        // Pattern 3: Array patterns like "supportedRefreshRates [120.0, 90.0, 60.0]"
+        if line.contains("supportedRefreshRates") || line.contains("supportedModes") {
+            if let Some(start) = line.find('[') {
+                if let Some(end) = line[start..].find(']') {
+                    let inner = &line[start + 1..start + end];
+                    for part in inner.split(',') {
+                        let trimmed = part.trim();
+                        if let Ok(val) = trimmed.parse::<f32>() {
+                            if (30.0..=360.0).contains(&val) {
+                                rates.push(val.round());
                             }
                         }
                     }
@@ -349,14 +378,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_refresh_rates_from_dumpsys() {
+    fn test_parse_refresh_rates_aosp_standard() {
         let sample = r#"
-            supportedModes [{id=1, width=1080, height=2400, fps=120.00001, vsync=120.00001}, {id=2, width=1080, height=2400, fps=90.0}, {id=3, width=1080, height=2400, fps=60.0}]
+            DisplayDeviceInfo{"Built-in Screen": uniqueId="local:4619827259835644672", 1080 x 2400, modeId 1, defaultModeId 1, supportedModes [{id=1, width=1080, height=2400, fps=120.00001, vsync=120.00001}, {id=2, width=1080, height=2400, fps=90.0}, {id=3, width=1080, height=2400, fps=60.000004}]}
             supportedRefreshRates [120.00001, 90.0, 60.0, 45.0, 30.0]
         "#;
         let rates = parse_refresh_rates_from_dumpsys(sample);
-        assert!(rates.contains(&120.0));
-        assert!(rates.contains(&90.0));
-        assert!(rates.contains(&60.0));
+        assert_eq!(rates, vec![30.0, 45.0, 60.0, 90.0, 120.0]);
+    }
+
+    #[test]
+    fn test_parse_refresh_rates_surface_flinger_modes() {
+        let sample = r#"
+            Display 4619827259835644672 (HWC display 0): active mode 0
+              Display modes:
+                Mode 0: 1080x2400, renderFrameRate 144.00 fps, vsyncRate 144.00 Hz
+                Mode 1: 1080x2400, renderFrameRate 120.00 fps, vsyncRate 120.00 Hz
+                Mode 2: 1080x2400, renderFrameRate 90.00 fps, vsyncRate 90.00 Hz
+                Mode 3: 1080x2400, renderFrameRate 60.00 fps, vsyncRate 60.00 Hz
+        "#;
+        let rates = parse_refresh_rates_from_dumpsys(sample);
+        assert_eq!(rates, vec![60.0, 90.0, 120.0, 144.0]);
+    }
+
+    #[test]
+    fn test_parse_refresh_rates_samsung_oneui() {
+        let sample = r#"
+            mSupportedModes=[DisplayModeRecord{mMode={id=1, width=1080, height=2340, fps=120.0}}, DisplayModeRecord{mMode={id=2, width=1080, height=2340, fps=60.0}}]
+        "#;
+        let rates = parse_refresh_rates_from_dumpsys(sample);
+        assert_eq!(rates, vec![60.0, 120.0]);
+    }
+
+    #[test]
+    fn test_parse_refresh_rates_empty_or_malformed() {
+        assert_eq!(parse_refresh_rates_from_dumpsys(""), Vec::<f32>::new());
+        assert_eq!(parse_refresh_rates_from_dumpsys("random content with no numbers"), Vec::<f32>::new());
+        assert_eq!(parse_refresh_rates_from_dumpsys("fps=0.0 fps=1000.0"), Vec::<f32>::new());
     }
 }
