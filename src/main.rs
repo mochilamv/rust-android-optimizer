@@ -1,0 +1,309 @@
+mod aot_compiler;
+mod env_probe;
+mod event_listener;
+mod extreme_optimizer;
+mod hw_probe;
+mod shizuku;
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tokio::signal::unix::{signal, SignalKind};
+
+fn get_pid_file_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".to_string());
+    PathBuf::from(home).join(".rust-android-optimizer.pid")
+}
+
+fn get_log_file_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".to_string());
+    PathBuf::from(home).join(".rust-android-optimizer.log")
+}
+
+fn read_running_pid() -> Option<i32> {
+    let pid_path = get_pid_file_path();
+    if !pid_path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&pid_path).ok()?;
+    let pid: i32 = content.trim().parse().ok()?;
+    // Check if process is alive via kill(pid, 0)
+    let res = unsafe { libc::kill(pid, 0) };
+    if res == 0 {
+        Some(pid)
+    } else {
+        // Stale pid file
+        let _ = fs::remove_file(&pid_path);
+        None
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let subcommand = args.get(1).map(|s| s.as_str()).unwrap_or("daemon");
+
+    match subcommand {
+        "start" => handle_cmd_start().await,
+        "stop" => handle_cmd_stop().await,
+        "status" => handle_cmd_status().await,
+        "bench" | "benchmark" => handle_cmd_bench().await,
+        "daemon" | "run" => handle_cmd_daemon().await,
+        "--help" | "-h" | "help" => print_help(),
+        other => {
+            eprintln!("[ERROR] Unknown command: {}", other);
+            print_help();
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_help() {
+    println!("=== Rust Android Optimizer v0.3.0 ===");
+    println!("Usage: rust-android-optimizer <command>");
+    println!();
+    println!("Commands:");
+    println!("  start      Start the optimizer daemon in background");
+    println!("  stop       Stop the running daemon and restore system");
+    println!("  status     Check daemon running state and PID");
+    println!("  bench      Run hardware probe, display detection and latency benchmark");
+    println!("  daemon     Run daemon directly in foreground");
+    println!("  help       Show this help message");
+}
+
+async fn handle_cmd_start() {
+    if let Some(pid) = read_running_pid() {
+        println!("[INFO] Optimizer daemon is already running (PID: {}).", pid);
+        return;
+    }
+
+    if !shizuku::is_available() {
+        eprintln!("[FATAL] Shizuku rish not found at {}", shizuku::RISH_PATH);
+        eprintln!("        Please install Shizuku and grant Termux access.");
+        std::process::exit(1);
+    }
+
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rust-android-optimizer"));
+    let log_path = get_log_file_path();
+
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(&log_path)
+        .expect("Failed to open daemon log file");
+
+    let child = std::process::Command::new(exe_path)
+        .arg("daemon")
+        .stdout(log_file.try_clone().unwrap())
+        .stderr(log_file)
+        .spawn();
+
+    match child {
+        Ok(child) => {
+            let pid = child.id() as i32;
+            let pid_path = get_pid_file_path();
+            let _ = fs::write(&pid_path, pid.to_string());
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+            println!("==================================================");
+            println!("[OK] Rust Android Optimizer daemon started!");
+            println!("     PID     : {}", pid);
+            println!("     Log File: {}", log_path.display());
+            println!("==================================================");
+            println!("Commands available:");
+            println!("  rust-optimizer-status  -> Check daemon state");
+            println!("  rust-optimizer-stop    -> Stop daemon & restore system");
+        }
+        Err(e) => {
+            eprintln!("[ERROR] Failed to start daemon in background: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn handle_cmd_stop() {
+    let pid_path = get_pid_file_path();
+    if let Some(pid) = read_running_pid() {
+        println!("[INFO] Stopping daemon (PID: {})...", pid);
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+
+        // Wait up to 3 seconds for clean exit
+        for _ in 0..30 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let res = unsafe { libc::kill(pid, 0) };
+            if res != 0 {
+                break;
+            }
+        }
+
+        let _ = fs::remove_file(&pid_path);
+        println!("[OK] Daemon stopped successfully. System settings restored.");
+    } else {
+        let _ = fs::remove_file(&pid_path);
+        println!("[INFO] Daemon is not running.");
+    }
+}
+
+async fn handle_cmd_status() {
+    println!("=== Rust Android Optimizer - Status ===");
+    if let Some(pid) = read_running_pid() {
+        println!("State   : RUNNING");
+        println!("PID     : {}", pid);
+        println!("Log File: {}", get_log_file_path().display());
+        println!("Binary  : rust-android-optimizer v0.3.0");
+    } else {
+        println!("State   : STOPPED");
+        println!("PID file: None");
+    }
+}
+
+async fn handle_cmd_bench() {
+    println!("========================================================================");
+    println!("            RUST ANDROID OPTIMIZER - BENCHMARK & HARDWARE PROBE        ");
+    println!("========================================================================");
+
+    if !shizuku::is_available() {
+        eprintln!("[FATAL] Shizuku rish not found at {}", shizuku::RISH_PATH);
+        eprintln!("        Please install Shizuku and grant Termux access.");
+        return;
+    }
+
+    let profile = env_probe::HardwareProfile::probe().await;
+
+    println!("[DEVICE IDENTIFICATION]");
+    println!("  Manufacturer : {}", profile.manufacturer);
+    println!("  Model        : {}", profile.model);
+    println!("  SoC Vendor   : {}", profile.soc_vendor);
+    println!("  Platform     : {}", profile.platform);
+    println!("  OEM / ROM    : {}", profile.oem_flavor);
+    println!("  Android OS   : Android {} (API Level {})", profile.android_release, profile.android_api);
+    println!();
+
+    println!("[DISPLAY DETECTION]");
+    println!("  Supported Hz : {:?}", profile.display.supported_rates);
+    println!("  Max Lock Hz  : {:.1} Hz", profile.display.max_refresh_rate);
+    println!();
+
+    println!("[FEATURE COMPATIBILITY MATRIX]");
+    println!("  [+] Shizuku / ADB Access     : {}", if profile.features.shizuku_active { "ACTIVE (uid=2000/0)" } else { "DISABLED" });
+    println!("  [+] Fixed Performance Mode   : {}", if profile.features.fixed_performance_mode { "SUPPORTED (API >= 30)" } else { "UNSUPPORTED" });
+    println!("  [+] Thermal Override (0)     : {}", if profile.features.thermal_override { "SUPPORTED" } else { "UNSUPPORTED" });
+    println!("  [+] Android Game Mode API    : {}", if profile.features.game_mode_api { "SUPPORTED (API >= 31)" } else { "UNSUPPORTED" });
+    println!("  [+] Doze Background Freeze   : {}", if profile.features.doze_force_idle { "SUPPORTED" } else { "UNSUPPORTED" });
+    println!("  [+] Dynamic Refresh Lock     : {}", if profile.features.display_rate_lock { "SUPPORTED" } else { "UNSUPPORTED" });
+    println!("  [+] Touch Latency Reduction  : {}", if profile.features.touch_latency_flags { "SUPPORTED" } else { "UNSUPPORTED" });
+    println!("  [+] WiFi Latency Tuning      : {}", if profile.features.wifi_power_save_flag { "SUPPORTED" } else { "UNSUPPORTED" });
+    println!("  [+] RAM Plus / Swap Control  : {}", if profile.features.ram_expansion_control { "SUPPORTED" } else { "UNSUPPORTED" });
+    println!();
+
+    println!("[MICRO-BENCHMARK]");
+    // Shizuku IPC latency test
+    let start = Instant::now();
+    for _ in 0..5 {
+        let _ = shizuku::exec("id").await;
+    }
+    let ipc_avg = start.elapsed().as_micros() as f64 / 5.0;
+    println!("  Shizuku IPC Round-trip (avg) : {:.2} ms", ipc_avg / 1000.0);
+
+    // Sysfs direct pread latency
+    let start_sysfs = Instant::now();
+    for _ in 0..100 {
+        let _ = hw_probe::get_gpu_clock();
+    }
+    let sysfs_avg = start_sysfs.elapsed().as_nanos() as f64 / 100.0;
+    println!("  Sysfs Direct pread Latency   : {:.2} ns", sysfs_avg);
+
+    println!("========================================================================");
+}
+
+async fn handle_cmd_daemon() {
+    println!("=== Rust Android Optimizer v0.3.0 - Daemon ===");
+    println!("Target: aarch64-linux-android (native)");
+
+    // Pre-flight checks
+    if !shizuku::is_available() {
+        eprintln!("[FATAL] Shizuku rish not found at {}", shizuku::RISH_PATH);
+        eprintln!("        Please install Shizuku and grant Termux access.");
+        std::process::exit(1);
+    }
+    println!("[OK] Shizuku rish available");
+
+    // Write PID file
+    let pid = std::process::id() as i32;
+    let pid_path = get_pid_file_path();
+    let _ = fs::write(&pid_path, pid.to_string());
+
+    // Hardware and environment probe
+    println!("[INIT] Probing hardware, display and OS environment...");
+    let profile = env_probe::HardwareProfile::probe().await;
+    println!("[HW] Device: {} {} ({})", profile.manufacturer, profile.model, profile.soc_vendor);
+    println!("[HW] OS    : Android {} (API Level {}) - {}", profile.android_release, profile.android_api, profile.oem_flavor);
+    println!("[HW] Screen: Max refresh rate detected at {:.1} Hz", profile.display.max_refresh_rate);
+
+    // Game category cache (shared)
+    let game_cache: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    // Initialize AOT compiler (discovers packages via Shizuku)
+    println!("[INIT] Discovering packages for AOT compilation...");
+    let compiler = Arc::new(tokio::sync::Mutex::new(aot_compiler::AotCompiler::new().await));
+
+    // Initialize Extreme Optimizer with detected profile
+    let optimizer = Arc::new(extreme_optimizer::ExtremeOptimizer::new(profile));
+
+    let compiler_handle = {
+        let lock = compiler.lock().await;
+        aot_compiler::CompilerHandle {
+            suspended: lock.get_suspended_flag(),
+            notify: lock.get_notify(),
+            current_package: lock.get_current_package_arc(),
+        }
+    };
+    let compiler_handle = Arc::new(compiler_handle);
+
+    // Spawn the AOT compilation task (runs in background)
+    let compiler_run = compiler.clone();
+    let _compile_task = tokio::spawn(async move {
+        let mut lock = compiler_run.lock().await;
+        lock.run().await;
+    });
+
+    // Spawn the event loop (monitors logcat, controls compiler + doze)
+    let event_handle = compiler_handle.clone();
+    let event_optimizer = optimizer.clone();
+    let event_cache = game_cache.clone();
+    let event_task = tokio::spawn(async move {
+        event_listener::run_event_loop(event_handle, event_optimizer, event_cache).await;
+    });
+
+    println!("[DAEMON] Running... Monitoring game activity.");
+    println!("[DAEMON] AOT compilation started in background.");
+
+    // Signal listeners for graceful termination
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+
+    let optimizer_cleanup = optimizer.clone();
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            println!("[DAEMON] SIGTERM received. Restoring system and shutting down...");
+        }
+        _ = sigint.recv() => {
+            println!("[DAEMON] SIGINT (Ctrl+C) received. Restoring system and shutting down...");
+        }
+        _ = event_task => {
+            println!("[DAEMON] Event loop terminated unexpectedly.");
+        }
+    }
+
+    // Teardown: ensure system settings are restored
+    optimizer_cleanup.restore_system(None).await;
+    let _ = fs::remove_file(&pid_path);
+    println!("[DAEMON] Exited cleanly.");
+}

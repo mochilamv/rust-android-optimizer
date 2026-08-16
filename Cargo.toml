@@ -1,0 +1,20 @@
+[package]
+name = "rust-android-optimizer"
+version = "0.3.0"
+edition = "2024"
+authors = ["Mochilamv"]
+license = "MIT"
+description = "High-performance native Android gaming and latency optimizer daemon via Shizuku"
+
+[dependencies]
+libc = "0.2.189"
+memchr = "2.7"
+rustc-hash = "2.1"
+tokio = { version = "1.53.1", features = ["full"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

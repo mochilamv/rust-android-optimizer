@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# PID and runtime state files
+*.pid
+*.log
+/daemon.log
+
+# Agent & CLI metadata
+.gemini/
+.system_generated/
+scratch/
+brain/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

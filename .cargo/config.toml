@@ -1,0 +1,6 @@
+[build]
+rustflags = [
+    "-C", "target-cpu=cortex-a78",
+    "-C", "target-feature=+neon,+dotprod,+lse,+crc,+aes,+sha2,+fp16,+rcpc",
+    "-C", "llvm-args=--inline-threshold=275",
+]
