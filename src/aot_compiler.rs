@@ -1,8 +1,9 @@
 use crate::event_listener::is_known_emulator_or_game_name;
 use crate::shizuku;
+use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -27,6 +28,8 @@ pub struct CompilerHandle {
     pub suspended: Arc<AtomicBool>,
     pub abort_notify: Arc<Notify>,
     pub notify: Arc<Notify>,
+    /// parking_lot::Mutex: spinlock fast-path (~10 cycles) before futex,
+    /// vs std::sync::Mutex which goes directly to futex (~200+ cycles on contention).
     pub current_package: Arc<Mutex<Option<Box<str>>>>,
 }
 
@@ -35,7 +38,7 @@ impl CompilerHandle {
     pub fn suspend(&self) {
         self.suspended.store(true, Ordering::Release);
         self.abort_notify.notify_waiters();
-        let current = self.current_package.lock().unwrap();
+        let current = self.current_package.lock();
         if let Some(pkg) = &*current {
             println!("[AOT] Suspended compilation immediately. Interrupted: {}", pkg);
         } else {
@@ -183,8 +186,7 @@ impl AotCompiler {
             let target = &self.queue[idx];
 
             {
-                let mut current = self.current_package.lock().unwrap();
-                *current = Some(target.package.clone());
+                *self.current_package.lock() = Some(target.package.clone());
             }
 
             let compile_cmd = format!("cmd package compile -m speed -f {}", target.package);
@@ -193,8 +195,7 @@ impl AotCompiler {
             tokio::select! {
                 res = shizuku::exec(&compile_cmd) => {
                     {
-                        let mut current = self.current_package.lock().unwrap();
-                        *current = None;
+                        *self.current_package.lock() = None;
                     }
                     match res {
                         Ok(_output) => {
@@ -212,8 +213,7 @@ impl AotCompiler {
                 }
                 _ = abort.notified() => {
                     {
-                        let mut current = self.current_package.lock().unwrap();
-                        *current = None;
+                        *self.current_package.lock() = None;
                     }
                     println!("[AOT] Interrupted compilation of {}. Kept in queue for resumption.", target.package);
                     // Retain current idx to retry compiling this target upon resumption
@@ -236,9 +236,28 @@ impl AotCompiler {
     #[allow(dead_code)]
     #[inline(always)]
     pub fn get_current_package(&self) -> Option<Box<str>> {
-        let current = self.current_package.lock().unwrap();
-        current.clone()
+        self.current_package.lock().clone()
     }
+}
+
+/// Zero-alloc case-insensitive substring search (same as event_listener).
+/// Avoids to_lowercase() allocation on every category line in hot parse loop.
+#[inline(always)]
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    for i in 0..=(h.len() - n.len()) {
+        if h[i..i + n.len()].iter().zip(n.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Pure parser function to extract game packages from dumpsys package output.
@@ -260,7 +279,7 @@ pub fn parse_package_categories_from_dumpsys(dumpsys: &str) -> FxHashSet<Box<str
             }
         } else if trimmed.contains("category=1")
             || trimmed.contains("category=GAME")
-            || trimmed.to_lowercase().contains("category_game")
+            || contains_ignore_ascii_case(trimmed, "category_game")
             || trimmed.contains("appCategory=\"1\"")
             || trimmed.contains("appCategory=\"GAME\"")
             || (trimmed.contains("flags=[") && trimmed.contains("GAME"))
@@ -329,5 +348,12 @@ mod tests {
         assert_eq!(queue[0].category, PackageCategory::Game);
         assert_eq!(queue[1].category, PackageCategory::UserApp);
         assert_eq!(queue[2].category, PackageCategory::SystemSafe);
+    }
+
+    #[test]
+    fn test_contains_ignore_ascii_case() {
+        assert!(contains_ignore_ascii_case("Category_Game", "category_game"));
+        assert!(contains_ignore_ascii_case("CATEGORY_GAME", "category_game"));
+        assert!(!contains_ignore_ascii_case("category=1", "category_game"));
     }
 }

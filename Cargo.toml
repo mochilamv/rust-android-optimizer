@@ -9,6 +9,7 @@ description = "High-performance native Android gaming and latency optimizer daem
 [dependencies]
 libc = "0.2.189"
 memchr = "2.7"
+parking_lot = "0.12"
 rustc-hash = "2.1"
 tokio = { version = "1.53.1", features = ["full"] }
 
@@ -18,3 +19,6 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[profile.dev]
+opt-level = 1

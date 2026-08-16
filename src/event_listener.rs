@@ -1,7 +1,8 @@
-use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashMap;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
@@ -16,7 +17,7 @@ use crate::shizuku;
 pub(crate) struct CacheAligned<T>(pub(crate) T);
 
 pub struct GameState {
-    pub active_games: Mutex<HashMap<String, bool>>,
+    pub active_games: Mutex<FxHashMap<Box<str>, bool>>,
     /// Padded to own cache line: written by resume_task, read by pause_task
     pub any_game_foreground: CacheAligned<AtomicBool>,
     /// Padded to own cache line: written/read concurrently by both tasks
@@ -26,16 +27,43 @@ pub struct GameState {
 impl GameState {
     pub fn new() -> Self {
         Self {
-            active_games: Mutex::new(HashMap::new()),
+            active_games: Mutex::new(FxHashMap::default()),
             any_game_foreground: CacheAligned(AtomicBool::new(false)),
             pause_generation: CacheAligned(AtomicU64::new(0)),
         }
     }
 }
 
+/// Zero-allocation case-insensitive ASCII substring search.
+#[inline(always)]
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let h_bytes = haystack.as_bytes();
+    let n_bytes = needle.as_bytes();
+    if n_bytes.is_empty() {
+        return true;
+    }
+    if h_bytes.len() < n_bytes.len() {
+        return false;
+    }
+    let max_start = h_bytes.len() - n_bytes.len();
+    for i in 0..=max_start {
+        let mut matches = true;
+        for j in 0..n_bytes.len() {
+            if !h_bytes[i + j].eq_ignore_ascii_case(&n_bytes[j]) {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return true;
+        }
+    }
+    false
+}
+
 /// Known emulator and game namespaces/keywords for rapid heuristic classification.
+/// Completely zero heap allocation.
 pub fn is_known_emulator_or_game_name(pkg: &str) -> bool {
-    let lower = pkg.to_lowercase();
     const PATTERNS: &[&str] = &[
         // Emulators & Virtualization
         "retroarch",
@@ -108,7 +136,7 @@ pub fn is_known_emulator_or_game_name(pkg: &str) -> bool {
     ];
 
     for pattern in PATTERNS {
-        if lower.contains(pattern) {
+        if contains_ignore_ascii_case(pkg, pattern) {
             return true;
         }
     }
@@ -183,18 +211,18 @@ pub fn extract_package(line: &str) -> Option<&str> {
     None
 }
 
-pub async fn check_if_game(pkg: &str, cache: &Arc<Mutex<HashMap<String, bool>>>) -> bool {
+pub async fn check_if_game(pkg: &str, cache: &Arc<RwLock<FxHashMap<Box<str>, bool>>>) -> bool {
     {
-        let cache_lock = cache.lock().unwrap();
-        if let Some(&is_game) = cache_lock.get(pkg) {
+        let cache_read = cache.read();
+        if let Some(&is_game) = cache_read.get(pkg) {
             return is_game;
         }
     }
 
-    // Heuristic 1: Known emulator/game naming pattern
+    // Heuristic 1: Known emulator/game naming pattern (zero-alloc)
     if is_known_emulator_or_game_name(pkg) {
-        let mut cache_lock = cache.lock().unwrap();
-        cache_lock.insert(pkg.to_string(), true);
+        let mut cache_write = cache.write();
+        cache_write.insert(pkg.into(), true);
         return true;
     }
 
@@ -209,15 +237,15 @@ pub async fn check_if_game(pkg: &str, cache: &Arc<Mutex<HashMap<String, bool>>>)
         || output.contains("appCategory=\"GAME\"")
         || (output.contains("flags=[") && output.contains("GAME"));
 
-    let mut cache_lock = cache.lock().unwrap();
-    cache_lock.insert(pkg.to_string(), is_game);
+    let mut cache_write = cache.write();
+    cache_write.insert(pkg.into(), is_game);
     is_game
 }
 
 pub async fn run_event_loop(
     compiler: Arc<CompilerHandle>,
     optimizer: Arc<ExtremeOptimizer>,
-    game_cache: Arc<Mutex<HashMap<String, bool>>>,
+    game_cache: Arc<RwLock<FxHashMap<Box<str>, bool>>>,
 ) {
     let state = Arc::new(GameState::new());
 
@@ -248,8 +276,8 @@ pub async fn run_event_loop(
                     state_resume.pause_generation.0.fetch_add(1, Ordering::SeqCst);
 
                     {
-                        let mut active = state_resume.active_games.lock().unwrap();
-                        active.insert(pkg.to_string(), true);
+                        let mut active = state_resume.active_games.lock();
+                        active.insert(pkg.into(), true);
                     }
                     state_resume
                         .any_game_foreground
@@ -287,7 +315,7 @@ pub async fn run_event_loop(
                     println!("[EVENT] Game paused: {}", pkg);
 
                     {
-                        let mut active = state_pause.active_games.lock().unwrap();
+                        let mut active = state_pause.active_games.lock();
                         active.remove(pkg);
                     }
 
@@ -303,7 +331,7 @@ pub async fn run_event_loop(
 
                         if state_worker.pause_generation.0.load(Ordering::SeqCst) == generation_id {
                             let any_active = {
-                                let active = state_worker.active_games.lock().unwrap();
+                                let active = state_worker.active_games.lock();
                                 !active.is_empty()
                             };
 
@@ -384,6 +412,13 @@ mod tests {
         assert!(!is_known_emulator_or_game_name("com.android.settings"));
         assert!(!is_known_emulator_or_game_name("com.google.android.youtube"));
         assert!(!is_known_emulator_or_game_name("com.whatsapp"));
+    }
+
+    #[test]
+    fn test_contains_ignore_ascii_case() {
+        assert!(contains_ignore_ascii_case("com.dts.FreeFireTH", "freefire"));
+        assert!(contains_ignore_ascii_case("ORG.PPSSPP.PPSSPP", "ppsspp"));
+        assert!(!contains_ignore_ascii_case("com.android.settings", "yuzu"));
     }
 
     #[test]

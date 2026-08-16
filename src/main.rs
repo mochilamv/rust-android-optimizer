@@ -5,12 +5,13 @@ mod extreme_optimizer;
 mod hw_probe;
 mod shizuku;
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::signal::unix::{signal, SignalKind};
+
+use extreme_optimizer::OperationalMode;
 
 fn get_pid_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".to_string());
@@ -20,6 +21,23 @@ fn get_pid_file_path() -> PathBuf {
 fn get_log_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".to_string());
     PathBuf::from(home).join(".rust-android-optimizer.log")
+}
+
+pub fn get_mode_file_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".to_string());
+    PathBuf::from(home).join(".rust-android-optimizer.mode")
+}
+
+pub fn read_operational_mode() -> OperationalMode {
+    let mode_path = get_mode_file_path();
+    if let Ok(content) = fs::read_to_string(&mode_path) {
+        match content.trim().to_lowercase().as_str() {
+            "performance" | "perf" | "2" => OperationalMode::Performance,
+            _ => OperationalMode::Adaptive,
+        }
+    } else {
+        OperationalMode::Adaptive
+    }
 }
 
 fn read_running_pid() -> Option<i32> {
@@ -67,7 +85,7 @@ fn print_help() {
     println!("Commands:");
     println!("  start      Start the optimizer daemon in background");
     println!("  stop       Stop the running daemon and restore system");
-    println!("  status     Check daemon running state and PID");
+    println!("  status     Check daemon running state, mode and PID");
     println!("  bench      Run hardware probe, display detection and latency benchmark");
     println!("  daemon     Run daemon directly in foreground");
     println!("  help       Show this help message");
@@ -87,6 +105,7 @@ async fn handle_cmd_start() {
 
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rust-android-optimizer"));
     let log_path = get_log_file_path();
+    let mode = read_operational_mode();
 
     let log_file = fs::OpenOptions::new()
         .create(true)
@@ -112,6 +131,7 @@ async fn handle_cmd_start() {
             println!("==================================================");
             println!("[OK] Rust Android Optimizer daemon started!");
             println!("     PID     : {}", pid);
+            println!("     Mode    : {}", mode);
             println!("     Log File: {}", log_path.display());
             println!("==================================================");
             println!("Commands available:");
@@ -152,13 +172,16 @@ async fn handle_cmd_stop() {
 
 async fn handle_cmd_status() {
     println!("=== Rust Android Optimizer - Status ===");
+    let mode = read_operational_mode();
     if let Some(pid) = read_running_pid() {
         println!("State   : RUNNING");
         println!("PID     : {}", pid);
+        println!("Mode    : {}", mode);
         println!("Log File: {}", get_log_file_path().display());
         println!("Binary  : rust-android-optimizer v0.3.0");
     } else {
         println!("State   : STOPPED");
+        println!("Mode    : {}", mode);
         println!("PID file: None");
     }
 }
@@ -175,6 +198,7 @@ async fn handle_cmd_bench() {
     }
 
     let profile = env_probe::HardwareProfile::probe().await;
+    let mode = read_operational_mode();
 
     println!("[DEVICE IDENTIFICATION]");
     println!("  Manufacturer : {}", profile.manufacturer);
@@ -183,6 +207,7 @@ async fn handle_cmd_bench() {
     println!("  Platform     : {}", profile.platform);
     println!("  OEM / ROM    : {}", profile.oem_flavor);
     println!("  Android OS   : Android {} (API Level {})", profile.android_release, profile.android_api);
+    println!("  Active Mode  : {}", mode);
     println!();
 
     println!("[DISPLAY DETECTION]");
@@ -239,22 +264,37 @@ async fn handle_cmd_daemon() {
     let pid_path = get_pid_file_path();
     let _ = fs::write(&pid_path, pid.to_string());
 
-    // Hardware and environment probe
+    // Hardware, mode and environment probe
     println!("[INIT] Probing hardware, display and OS environment...");
     let profile = env_probe::HardwareProfile::probe().await;
+    let mode = read_operational_mode();
     println!("[HW] Device: {} {} ({})", profile.manufacturer, profile.model, profile.soc_vendor);
     println!("[HW] OS    : Android {} (API Level {}) - {}", profile.android_release, profile.android_api, profile.oem_flavor);
     println!("[HW] Screen: Max refresh rate detected at {:.1} Hz", profile.display.max_refresh_rate);
+    println!("[INIT] Operational Mode: {}", mode);
 
-    // Game category cache (shared)
-    let game_cache: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Disable Phantom Process Killer on Android 12+ (API 31+) to safeguard background daemon and compiler workers
+    if profile.android_api >= 31 {
+        let _ = shizuku::exec("/system/bin/device_config put activity_manager max_phantom_processes 2147483647; /system/bin/device_config set_sync_disabled_for_tests persistent; setprop persist.sys.fflag.override.settings_enable_monitor_phantom_procs false").await;
+        println!("[OK] Phantom Process Killer disabled (max_phantom_processes=2147483647)");
+    }
+
+    // Game category cache (shared lock-free reads via RwLock + FxHashMap)
+    let game_cache: Arc<parking_lot::RwLock<rustc_hash::FxHashMap<Box<str>, bool>>> =
+        Arc::new(parking_lot::RwLock::new(rustc_hash::FxHashMap::default()));
 
     // Initialize AOT compiler (discovers packages via Shizuku)
     println!("[INIT] Discovering packages for AOT compilation...");
     let compiler = Arc::new(tokio::sync::Mutex::new(aot_compiler::AotCompiler::new().await));
 
-    // Initialize Extreme Optimizer with detected profile
-    let optimizer = Arc::new(extreme_optimizer::ExtremeOptimizer::new(profile));
+    // Initialize Extreme Optimizer with detected profile & operational mode
+    let optimizer = Arc::new(extreme_optimizer::ExtremeOptimizer::new(profile, mode));
+
+    // In Performance mode, ensure system baseline tweaks are applied immediately
+    if mode == OperationalMode::Performance {
+        println!("[INIT] Performance mode: Applying baseline optimizations...");
+        optimizer.apply_optimizations(None).await;
+    }
 
     let compiler_handle = {
         let lock = compiler.lock().await;
@@ -303,8 +343,8 @@ async fn handle_cmd_daemon() {
         }
     }
 
-    // Teardown: ensure system settings are restored
-    optimizer_cleanup.restore_system(None).await;
+    // Teardown: ensure full system settings are restored strictly to snapshot
+    optimizer_cleanup.full_restore_on_shutdown().await;
     let _ = fs::remove_file(&pid_path);
     println!("[DAEMON] Exited cleanly.");
 }

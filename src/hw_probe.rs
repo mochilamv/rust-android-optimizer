@@ -111,33 +111,28 @@ pub fn get_thermal_zone_temp(zone: u8) -> Option<u32> {
     let prefix = b"/sys/class/thermal/thermal_zone";
     let mut idx = 0;
 
-    for &b in prefix.iter() {
-        path[idx] = b;
-        idx += 1;
-    }
+    // copy_from_slice: LLVM auto-vectorizes to NEON stp for prefix (<64B on aarch64)
+    path[idx..idx + prefix.len()].copy_from_slice(prefix);
+    idx += prefix.len();
 
     if zone >= 100 {
         path[idx] = b'0' + (zone / 100);
-        idx += 1;
-        path[idx] = b'0' + ((zone / 10) % 10);
-        idx += 1;
-        path[idx] = b'0' + (zone % 10);
-        idx += 1;
+        path[idx + 1] = b'0' + ((zone / 10) % 10);
+        path[idx + 2] = b'0' + (zone % 10);
+        idx += 3;
     } else if zone >= 10 {
         path[idx] = b'0' + (zone / 10);
-        idx += 1;
-        path[idx] = b'0' + (zone % 10);
-        idx += 1;
+        path[idx + 1] = b'0' + (zone % 10);
+        idx += 2;
     } else {
         path[idx] = b'0' + zone;
         idx += 1;
     }
 
-    let suffix = b"/temp\0";
-    for &b in suffix.iter() {
-        path[idx] = b;
-        idx += 1;
-    }
+    // copy_from_slice: LLVM emits NEON ldp/stp (16 bytes in ~2 cycles) vs scalar byte loop
+    const SUFFIX: &[u8] = b"/temp\0";
+    path[idx..idx + SUFFIX.len()].copy_from_slice(SUFFIX);
+    idx += SUFFIX.len();
 
     read_sysfs_u32(&path[..idx])
 }
