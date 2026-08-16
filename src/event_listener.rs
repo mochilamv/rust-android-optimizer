@@ -249,107 +249,129 @@ pub async fn run_event_loop(
 ) {
     let state = Arc::new(GameState::new());
 
-    // Spawn resume monitor
+    // Spawn resilient resume monitor (auto-reconnects if logcat restarts or buffer rotates)
     let state_resume = state.clone();
     let compiler_resume = compiler.clone();
     let optimizer_resume = optimizer.clone();
     let game_cache_resume = game_cache.clone();
 
     let resume_task = tokio::spawn(async move {
-        let mut cmd = Command::new("/data/data/com.termux/files/usr/bin/rish")
-            .arg("-c")
-            .arg("logcat -b events -v raw -s am_resume_activity")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to spawn logcat resume monitor");
+        loop {
+            let child_res = Command::new("/data/data/com.termux/files/usr/bin/rish")
+                .arg("-c")
+                .arg("logcat -b events -v raw -s am_resume_activity")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
 
-        let stdout = cmd.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout).lines();
+            match child_res {
+                Ok(mut cmd) => {
+                    if let Some(stdout) = cmd.stdout.take() {
+                        let mut reader = BufReader::new(stdout).lines();
+                        while let Ok(Some(line)) = reader.next_line().await {
+                            if let Some(pkg) = extract_package(&line) {
+                                if check_if_game(pkg, &game_cache_resume).await {
+                                    println!("[EVENT] Game resumed: {}", pkg);
 
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(pkg) = extract_package(&line) {
-                if check_if_game(pkg, &game_cache_resume).await {
-                    println!("[EVENT] Game resumed: {}", pkg);
+                                    // Cancel pending pause debounces immediately
+                                    state_resume.pause_generation.0.fetch_add(1, Ordering::SeqCst);
 
-                    // Cancel pending pause debounces immediately
-                    state_resume.pause_generation.0.fetch_add(1, Ordering::SeqCst);
+                                    {
+                                        let mut active = state_resume.active_games.lock();
+                                        active.insert(pkg.into(), true);
+                                    }
+                                    state_resume
+                                        .any_game_foreground
+                                        .0
+                                        .store(true, Ordering::Release);
 
-                    {
-                        let mut active = state_resume.active_games.lock();
-                        active.insert(pkg.into(), true);
+                                    compiler_resume.suspend();
+                                    optimizer_resume.apply_optimizations(Some(pkg)).await;
+                                }
+                            }
+                        }
                     }
-                    state_resume
-                        .any_game_foreground
-                        .0
-                        .store(true, Ordering::Release);
-
-                    compiler_resume.suspend();
-                    optimizer_resume.apply_optimizations(Some(pkg)).await;
+                    let _ = cmd.wait().await;
+                }
+                Err(e) => {
+                    eprintln!("[EVENT ERROR] Failed to spawn logcat resume monitor: {}. Retrying in 1.5s...", e);
                 }
             }
+            sleep(Duration::from_millis(1500)).await;
         }
     });
 
-    // Spawn pause monitor
+    // Spawn resilient pause monitor (auto-reconnects if logcat restarts or buffer rotates)
     let state_pause = state.clone();
     let compiler_pause = compiler.clone();
     let optimizer_pause = optimizer.clone();
     let game_cache_pause = game_cache.clone();
 
     let pause_task = tokio::spawn(async move {
-        let mut cmd = Command::new("/data/data/com.termux/files/usr/bin/rish")
-            .arg("-c")
-            .arg("logcat -b events -v raw -s am_pause_activity")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to spawn logcat pause monitor");
+        loop {
+            let child_res = Command::new("/data/data/com.termux/files/usr/bin/rish")
+                .arg("-c")
+                .arg("logcat -b events -v raw -s am_pause_activity")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
 
-        let stdout = cmd.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout).lines();
+            match child_res {
+                Ok(mut cmd) => {
+                    if let Some(stdout) = cmd.stdout.take() {
+                        let mut reader = BufReader::new(stdout).lines();
+                        while let Ok(Some(line)) = reader.next_line().await {
+                            if let Some(pkg) = extract_package(&line) {
+                                if check_if_game(pkg, &game_cache_pause).await {
+                                    println!("[EVENT] Game paused: {}", pkg);
 
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(pkg) = extract_package(&line) {
-                if check_if_game(pkg, &game_cache_pause).await {
-                    println!("[EVENT] Game paused: {}", pkg);
+                                    {
+                                        let mut active = state_pause.active_games.lock();
+                                        active.remove(pkg);
+                                    }
 
-                    {
-                        let mut active = state_pause.active_games.lock();
-                        active.remove(pkg);
-                    }
+                                    // Increment generation and spawn non-blocking debounce task
+                                    let generation_id =
+                                        state_pause.pause_generation.0.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let state_worker = state_pause.clone();
+                                    let compiler_worker = compiler_pause.clone();
+                                    let optimizer_worker = optimizer_pause.clone();
 
-                    // Increment generation and spawn non-blocking debounce task
-                    let generation_id =
-                        state_pause.pause_generation.0.fetch_add(1, Ordering::SeqCst) + 1;
-                    let state_worker = state_pause.clone();
-                    let compiler_worker = compiler_pause.clone();
-                    let optimizer_worker = optimizer_pause.clone();
+                                    tokio::spawn(async move {
+                                        sleep(Duration::from_secs(5)).await;
 
-                    tokio::spawn(async move {
-                        sleep(Duration::from_secs(5)).await;
+                                        if state_worker.pause_generation.0.load(Ordering::SeqCst) == generation_id {
+                                            let any_active = {
+                                                let active = state_worker.active_games.lock();
+                                                !active.is_empty()
+                                            };
 
-                        if state_worker.pause_generation.0.load(Ordering::SeqCst) == generation_id {
-                            let any_active = {
-                                let active = state_worker.active_games.lock();
-                                !active.is_empty()
-                            };
-
-                            if any_active {
-                                println!("[EVENT] Another game is active, keeping compilation suspended and doze forced");
-                            } else {
-                                state_worker
-                                    .any_game_foreground
-                                    .0
-                                    .store(false, Ordering::Release);
-                                println!("[EVENT] No game active, resuming compilation and restoring system thermals");
-                                compiler_worker.resume();
-                                optimizer_worker.restore_system(None).await;
+                                            if any_active {
+                                                println!("[EVENT] Another game is active, keeping compilation suspended and doze forced");
+                                            } else {
+                                                state_worker
+                                                    .any_game_foreground
+                                                    .0
+                                                    .store(false, Ordering::Release);
+                                                println!("[EVENT] No game active, resuming compilation and restoring system thermals");
+                                                compiler_worker.resume();
+                                                optimizer_worker.restore_system(None).await;
+                                            }
+                                        }
+                                    });
+                                }
                             }
                         }
-                    });
+                    }
+                    let _ = cmd.wait().await;
+                }
+                Err(e) => {
+                    eprintln!("[EVENT ERROR] Failed to spawn logcat pause monitor: {}. Retrying in 1.5s...", e);
                 }
             }
+            sleep(Duration::from_millis(1500)).await;
         }
     });
 

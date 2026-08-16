@@ -6,6 +6,7 @@ mod hw_probe;
 mod shizuku;
 
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -107,6 +108,9 @@ async fn handle_cmd_start() {
     let log_path = get_log_file_path();
     let mode = read_operational_mode();
 
+    // Prevent Android from sleeping Termux while daemon is active
+    let _ = std::process::Command::new("termux-wake-lock").spawn();
+
     let log_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -114,11 +118,23 @@ async fn handle_cmd_start() {
         .open(&log_path)
         .expect("Failed to open daemon log file");
 
-    let child = std::process::Command::new(exe_path)
-        .arg("daemon")
+    let mut cmd = std::process::Command::new(exe_path);
+    cmd.arg("daemon")
+        .stdin(std::process::Stdio::null())
         .stdout(log_file.try_clone().unwrap())
-        .stderr(log_file)
-        .spawn();
+        .stderr(log_file);
+
+    // Completely detach child process from controlling terminal session via setsid()
+    // and ignore SIGHUP so closing the terminal never kills the daemon.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn();
 
     match child {
         Ok(child) => {
@@ -163,6 +179,7 @@ async fn handle_cmd_stop() {
         }
 
         let _ = fs::remove_file(&pid_path);
+        let _ = std::process::Command::new("termux-wake-unlock").spawn();
         println!("[OK] Daemon stopped successfully. System settings restored.");
     } else {
         let _ = fs::remove_file(&pid_path);
@@ -248,6 +265,11 @@ async fn handle_cmd_bench() {
 }
 
 async fn handle_cmd_daemon() {
+    // Ignore SIGHUP so terminal closing/hangup never kills the daemon
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+
     println!("=== Rust Android Optimizer v0.3.0 - Daemon ===");
     println!("Target: aarch64-linux-android (native)");
 
