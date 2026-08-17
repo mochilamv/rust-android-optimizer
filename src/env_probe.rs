@@ -47,11 +47,9 @@ impl fmt::Display for OemFlavor {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DisplayInfo {
     pub max_refresh_rate: f32,
-    pub current_refresh_rate: f32,
     pub supported_rates: Vec<f32>,
 }
 
@@ -236,11 +234,9 @@ async fn detect_display_info() -> DisplayInfo {
     rates.dedup();
 
     let max_refresh_rate = rates.last().copied().unwrap_or(60.0);
-    let current_refresh_rate = max_refresh_rate;
 
     DisplayInfo {
         max_refresh_rate,
-        current_refresh_rate,
         supported_rates: rates,
     }
 }

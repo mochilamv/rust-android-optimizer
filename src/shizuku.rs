@@ -1,6 +1,6 @@
 use std::fmt;
 use std::path::Path;
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Stdio;
 use std::sync::LazyLock;
 use tokio::process::Command as TokioCommand;
 
@@ -73,7 +73,6 @@ pub async fn exec(cmd: &str) -> Result<String, ShizukuError> {
     }
 }
 
-#[allow(dead_code)]
 pub async fn exec_detached(cmd: &str) -> Result<(), ShizukuError> {
     if !is_available() {
         return Err(ShizukuError::RishNotFound);
@@ -88,28 +87,4 @@ pub async fn exec_detached(cmd: &str) -> Result<(), ShizukuError> {
         .spawn()?;
 
     Ok(())
-}
-
-#[allow(dead_code)]
-pub fn exec_blocking(cmd: &str) -> Result<String, ShizukuError> {
-    if !is_available() {
-        return Err(ShizukuError::RishNotFound);
-    }
-
-    let output = StdCommand::new(RISH_PATH)
-        .arg("-c")
-        .arg(cmd)
-        .stdin(Stdio::null())
-        .output()?;
-
-    if output.status.success() {
-        let mut s = String::from_utf8(output.stdout).map_err(|_| ShizukuError::Utf8Error)?;
-        let trimmed_len = s.trim_end().len();
-        s.truncate(trimmed_len);
-        Ok(s)
-    } else {
-        let code = output.status.code().unwrap_or(-1);
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        Err(ShizukuError::NonZeroExit { code, stderr })
-    }
 }

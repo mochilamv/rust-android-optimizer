@@ -226,18 +226,6 @@ impl AotCompiler {
             self.compiled_count, self.total_count
         );
     }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn is_suspended(&self) -> bool {
-        self.suspended.load(Ordering::Acquire)
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn get_current_package(&self) -> Option<Box<str>> {
-        self.current_package.lock().clone()
-    }
 }
 
 /// Zero-alloc case-insensitive substring search (same as event_listener).

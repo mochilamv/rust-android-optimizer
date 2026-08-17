@@ -78,17 +78,6 @@ impl ExtremeOptimizer {
         }
     }
 
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn get_profile(&self) -> &HardwareProfile {
-        &self.profile
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn get_mode(&self) -> OperationalMode {
-        self.mode
-    }
 
     pub fn build_snapshot_capture_script() -> &'static str {
         concat!(
@@ -349,12 +338,6 @@ impl ExtremeOptimizer {
         self.active.store(false, Ordering::Relaxed);
         println!("[OPTIMIZER] Shutdown: All settings reverted strictly to pre-daemon snapshot.");
     }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
-    }
 }
 
 /// Parses batch settings output into a strongly typed SystemSnapshot.
@@ -541,7 +524,6 @@ mod tests {
             oem_flavor: OemFlavor::XiaomiMiuiHyperOs,
             display: crate::env_probe::DisplayInfo {
                 max_refresh_rate: 120.0,
-                current_refresh_rate: 120.0,
                 supported_rates: vec![60.0, 120.0],
             },
             features: crate::env_probe::FeatureSupport {
@@ -579,7 +561,6 @@ mod tests {
             oem_flavor: OemFlavor::XiaomiMiuiHyperOs,
             display: crate::env_probe::DisplayInfo {
                 max_refresh_rate: 120.0,
-                current_refresh_rate: 120.0,
                 supported_rates: vec![60.0, 120.0],
             },
             features: crate::env_probe::FeatureSupport {
@@ -633,7 +614,6 @@ mod tests {
             oem_flavor: OemFlavor::SamsungOneUi,
             display: crate::env_probe::DisplayInfo {
                 max_refresh_rate: 120.0,
-                current_refresh_rate: 120.0,
                 supported_rates: vec![60.0, 120.0],
             },
             features: crate::env_probe::FeatureSupport {

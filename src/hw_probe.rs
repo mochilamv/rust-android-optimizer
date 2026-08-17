@@ -44,10 +44,6 @@ unsafe impl Sync for SysfsFd {}
 static GPU_CLK_FD: LazyLock<Option<SysfsFd>> =
     LazyLock::new(|| SysfsFd::open(b"/sys/class/kgsl/kgsl-3d0/gpuclk\0"));
 
-#[allow(dead_code)]
-static THERMAL_ZONE0_FD: LazyLock<Option<SysfsFd>> =
-    LazyLock::new(|| SysfsFd::open(b"/sys/class/thermal/thermal_zone0/temp\0"));
-
 /// Branchless integer parse: reduces branch mispredictions on Cortex-A78.
 /// Processes only ASCII digit bytes [0x30..0x39] terminated by newline/non-digit.
 #[inline(always)]
@@ -73,68 +69,9 @@ fn parse_u32_branchless(buf: &[u8]) -> Option<u32> {
     }
 }
 
-/// Fallback for arbitrary sysfs paths not pre-opened.
-#[allow(dead_code)]
-pub fn read_sysfs_u32(path: &[u8]) -> Option<u32> {
-    unsafe {
-        let fd = open(path.as_ptr() as *const libc::c_char, O_RDONLY);
-        if fd < 0 {
-            return None;
-        }
-
-        let mut buf = [0u8; 32];
-        let bytes_read = pread(fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0);
-        close(fd);
-
-        if bytes_read <= 0 {
-            return None;
-        }
-
-        parse_u32_branchless(&buf[..bytes_read as usize])
-    }
-}
-
 #[inline(always)]
 pub fn get_gpu_clock() -> Option<u32> {
     GPU_CLK_FD.as_ref().and_then(|fd| fd.read_u32())
-}
-
-#[allow(dead_code)]
-#[inline(always)]
-pub fn get_thermal_zone_temp(zone: u8) -> Option<u32> {
-    if zone == 0 {
-        return THERMAL_ZONE0_FD.as_ref().and_then(|fd| fd.read_u32());
-    }
-
-    // Dynamic path for zones != 0
-    let mut path: [u8; 64] = [0; 64];
-    let prefix = b"/sys/class/thermal/thermal_zone";
-    let mut idx = 0;
-
-    // copy_from_slice: LLVM auto-vectorizes to NEON stp for prefix (<64B on aarch64)
-    path[idx..idx + prefix.len()].copy_from_slice(prefix);
-    idx += prefix.len();
-
-    if zone >= 100 {
-        path[idx] = b'0' + (zone / 100);
-        path[idx + 1] = b'0' + ((zone / 10) % 10);
-        path[idx + 2] = b'0' + (zone % 10);
-        idx += 3;
-    } else if zone >= 10 {
-        path[idx] = b'0' + (zone / 10);
-        path[idx + 1] = b'0' + (zone % 10);
-        idx += 2;
-    } else {
-        path[idx] = b'0' + zone;
-        idx += 1;
-    }
-
-    // copy_from_slice: LLVM emits NEON ldp/stp (16 bytes in ~2 cycles) vs scalar byte loop
-    const SUFFIX: &[u8] = b"/temp\0";
-    path[idx..idx + SUFFIX.len()].copy_from_slice(SUFFIX);
-    idx += SUFFIX.len();
-
-    read_sysfs_u32(&path[..idx])
 }
 
 #[cfg(test)]
