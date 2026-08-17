@@ -42,12 +42,12 @@ if ! "$RISH_PATH" -c "id" >/dev/null 2>&1; then
 fi
 echo -e "${COLOR_GREEN}[OK] Shizuku rish ativo e autorizado.${COLOR_RESET}"
 
-# 3. Desativacao do Phantom Process Killer (Android 12+)
-echo -e "[INFO] Desativando Phantom Process Killer (max_phantom_processes=2147483647)..."
-"$RISH_PATH" -c "/system/bin/device_config put activity_manager max_phantom_processes 2147483647 2>/dev/null; /system/bin/device_config set_sync_disabled_for_tests persistent 2>/dev/null; setprop persist.sys.fflag.override.settings_enable_monitor_phantom_procs false 2>/dev/null" >/dev/null 2>&1 || true
-echo -e "${COLOR_GREEN}[OK] Phantom Process Killer desativado com sucesso.${COLOR_RESET}"
+# 3. Blindagem de Segundo Plano (Phantom Process Killer & Whitelist de Bateria)
+echo -e "[INFO] Blindando Termux e Shizuku contra encerramento em segundo plano..."
+"$RISH_PATH" -c "/system/bin/device_config put activity_manager max_phantom_processes 2147483647 2>/dev/null; /system/bin/device_config set_sync_disabled_for_tests persistent 2>/dev/null; setprop persist.sys.fflag.override.settings_enable_monitor_phantom_procs false 2>/dev/null; dumpsys deviceidle whitelist +com.termux 2>/dev/null; dumpsys deviceidle whitelist +moe.shizuku.privileged.api 2>/dev/null; cmd appops set com.termux RUN_IN_BACKGROUND allow 2>/dev/null; cmd appops set com.termux RUN_ANY_IN_BACKGROUND allow 2>/dev/null; cmd appops set moe.shizuku.privileged.api RUN_IN_BACKGROUND allow 2>/dev/null; cmd appops set moe.shizuku.privileged.api RUN_ANY_IN_BACKGROUND allow 2>/dev/null" >/dev/null 2>&1 || true
+echo -e "${COLOR_GREEN}[OK] Termux e Shizuku blindados na whitelist do sistema.${COLOR_RESET}"
 
-# 3. Checagem do compilador Rust / Cargo
+# 4. Checagem do compilador Rust / Cargo
 if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
     echo -e "${COLOR_YELLOW}[INFO] Instalando compilador Rust via pkg...${COLOR_RESET}"
     pkg update -y
@@ -55,7 +55,7 @@ if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; the
 fi
 echo -e "${COLOR_GREEN}[OK] Compilador Rust: $(rustc --version)${COLOR_RESET}"
 
-# 4. Compilacao Nativa
+# 5. Compilacao Nativa
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -74,7 +74,7 @@ cp -f "$BIN_SOURCE" "$BIN_DEST"
 chmod 755 "$BIN_DEST"
 echo -e "${COLOR_GREEN}[OK] Binario instalado em $BIN_DEST${COLOR_RESET}"
 
-# 5. Insercao de Aliases
+# 6. Insercao de Aliases
 inject_aliases() {
     local rc_file="$1"
     if [ -f "$rc_file" ]; then
@@ -92,7 +92,38 @@ inject_aliases() {
 inject_aliases "$HOME/.bashrc"
 inject_aliases "$HOME/.zshrc"
 
-# 6. Selecao de Modo Operacional
+# 7. Opcao de Auto-Inicializacao com o Sistema (Termux:Boot)
+echo ""
+echo -e "${COLOR_YELLOW}Permitir inicializacao junto ao boot? (S/n)${COLOR_RESET}"
+read -r -t 15 ENABLE_BOOT || ENABLE_BOOT="s"
+BOOT_DIR="$HOME/.termux/boot"
+BOOT_SCRIPT="$BOOT_DIR/start-rust-optimizer.sh"
+
+if [[ "$ENABLE_BOOT" =~ ^[SsYy]?$ ]]; then
+    mkdir -p "$BOOT_DIR"
+    cat << 'EOF' > "$BOOT_SCRIPT"
+#!/data/data/com.termux/files/usr/bin/bash
+# Rust Android Optimizer - Auto-Start on Boot
+termux-wake-lock 2>/dev/null || true
+for i in $(seq 1 30); do
+    if [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ]; then
+        break
+    fi
+    sleep 1
+done
+sleep 5
+rust-android-optimizer start >/dev/null 2>&1
+EOF
+    chmod 755 "$BOOT_SCRIPT"
+    echo -e "${COLOR_GREEN}[OK] Auto-inicializacao ativada em $BOOT_SCRIPT (Termux:Boot)${COLOR_RESET}"
+else
+    if [ -f "$BOOT_SCRIPT" ]; then
+        rm -f "$BOOT_SCRIPT"
+    fi
+    echo -e "${COLOR_YELLOW}[INFO] Auto-inicializacao no boot desativada.${COLOR_RESET}"
+fi
+
+# 8. Selecao de Modo Operacional
 echo ""
 echo -e "${COLOR_BLUE}[MODO OPERACIONAL]${COLOR_RESET}"
 echo -e "Escolha o modo de operacao:"
@@ -107,7 +138,7 @@ else
     echo -e "${COLOR_GREEN}[OK] Modo definido: Adaptativo${COLOR_RESET}"
 fi
 
-# 7. Benchmark de Hardware Opcional
+# 9. Benchmark de Hardware Opcional
 echo ""
 echo -e "${COLOR_YELLOW}Executar teste e benchmark de hardware agora? (S/n)${COLOR_RESET}"
 read -r -t 15 RUN_BENCH || RUN_BENCH="s"
@@ -116,7 +147,7 @@ if [[ "$RUN_BENCH" =~ ^[SsYy]?$ ]]; then
     "$BIN_DEST" bench || true
 fi
 
-# 8. Limpeza de Cache de Build
+# 10. Limpeza de Cache de Build
 echo ""
 echo -e "${COLOR_YELLOW}Limpar arquivos temporarios de build (target/) para liberar espaco? (S/n)${COLOR_RESET}"
 read -r -t 15 CLEAN_BUILD || CLEAN_BUILD="s"
@@ -125,7 +156,7 @@ if [[ "$CLEAN_BUILD" =~ ^[SsYy]?$ ]]; then
     echo -e "${COLOR_GREEN}[OK] Cache de build limpo.${COLOR_RESET}"
 fi
 
-# 9. Conclusao
+# 11. Conclusao
 echo ""
 echo -e "${COLOR_GREEN}--- Instalacao Concluida com Sucesso! ---${COLOR_RESET}"
 echo -e "Comandos disponiveis:"

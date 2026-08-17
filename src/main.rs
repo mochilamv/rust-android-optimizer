@@ -6,6 +6,7 @@ mod hw_probe;
 mod shizuku;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,16 @@ fn get_pid_file_path() -> PathBuf {
 fn get_log_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".to_string());
     PathBuf::from(home).join(".rust-android-optimizer.log")
+}
+
+fn rotate_log_if_needed(log_path: &std::path::Path) {
+    if let Ok(metadata) = fs::metadata(log_path) {
+        if metadata.len() > 2 * 1024 * 1024 {
+            let mut old_path = log_path.to_path_buf();
+            old_path.set_extension("log.old");
+            let _ = fs::rename(log_path, old_path);
+        }
+    }
 }
 
 pub fn get_mode_file_path() -> PathBuf {
@@ -57,6 +68,42 @@ fn read_running_pid() -> Option<i32> {
         let _ = fs::remove_file(&pid_path);
         None
     }
+}
+
+fn ensure_termux_boot_script() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".to_string());
+    let boot_dir = PathBuf::from(home).join(".termux").join("boot");
+    if boot_dir.exists() || fs::create_dir_all(&boot_dir).is_ok() {
+        let script_path = boot_dir.join("start-rust-optimizer.sh");
+        let content = r#"#!/data/data/com.termux/files/usr/bin/bash
+# Rust Android Optimizer - Auto-Start on Boot
+termux-wake-lock 2>/dev/null || true
+for i in $(seq 1 30); do
+    if [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ]; then
+        break
+    fi
+    sleep 1
+done
+sleep 5
+rust-android-optimizer start >/dev/null 2>&1
+"#;
+        if fs::write(&script_path, content).is_ok() {
+            let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
+async fn apply_daemon_protection(pid: i32) {
+    let script = format!(
+        "echo -900 > /proc/{pid}/oom_score_adj 2>/dev/null; \
+         dumpsys deviceidle whitelist +com.termux 2>/dev/null; \
+         dumpsys deviceidle whitelist +moe.shizuku.privileged.api 2>/dev/null; \
+         cmd appops set com.termux RUN_IN_BACKGROUND allow 2>/dev/null; \
+         cmd appops set com.termux RUN_ANY_IN_BACKGROUND allow 2>/dev/null; \
+         cmd appops set moe.shizuku.privileged.api RUN_IN_BACKGROUND allow 2>/dev/null; \
+         cmd appops set moe.shizuku.privileged.api RUN_ANY_IN_BACKGROUND allow 2>/dev/null"
+    );
+    let _ = shizuku::exec(&script).await;
 }
 
 #[tokio::main]
@@ -108,8 +155,10 @@ async fn handle_cmd_start() {
     let log_path = get_log_file_path();
     let mode = read_operational_mode();
 
-    // Prevent Android from sleeping Termux while daemon is active
+    // Prevent Android from sleeping Termux CPU while daemon is active
     let _ = std::process::Command::new("termux-wake-lock").spawn();
+    ensure_termux_boot_script();
+    rotate_log_if_needed(&log_path);
 
     let log_file = fs::OpenOptions::new()
         .create(true)
@@ -300,6 +349,25 @@ async fn handle_cmd_daemon() {
         let _ = shizuku::exec("/system/bin/device_config put activity_manager max_phantom_processes 2147483647; /system/bin/device_config set_sync_disabled_for_tests persistent; setprop persist.sys.fflag.override.settings_enable_monitor_phantom_procs false").await;
         println!("[OK] Phantom Process Killer disabled (max_phantom_processes=2147483647)");
     }
+
+    // Apply Anti-OOM Kernel Protection (-900) and Battery Whitelisting for Termux & Shizuku
+    apply_daemon_protection(pid).await;
+    ensure_termux_boot_script();
+    let _ = std::process::Command::new("termux-wake-lock").spawn();
+    println!("[OK] Anti-OOM Kernel Protection (-900) and Battery Keepalive active");
+
+    // Watchdog keepalive task: periodically refreshes OOM protection & wake lock every 15 minutes
+    let watchdog_pid = pid;
+    let _watchdog_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(900));
+        loop {
+            interval.tick().await;
+            let _ = std::process::Command::new("termux-wake-lock").spawn();
+            apply_daemon_protection(watchdog_pid).await;
+            let log_path = get_log_file_path();
+            rotate_log_if_needed(&log_path);
+        }
+    });
 
     // Game category cache (shared lock-free reads via RwLock + FxHashMap)
     let game_cache: Arc<parking_lot::RwLock<rustc_hash::FxHashMap<Box<str>, bool>>> =
